@@ -133,7 +133,11 @@ static void test_scheduler(void)
     ok(sched.active.smallest_urgency == H2O_ABSPRIO_NUM_URGENCY_LEVELS);
 }
 
+#include "h3-fixture.c"
+#include "reliable-reset.c"
+
 void test_lib__http3_server(void)
 {
     subtest("scheduler", test_scheduler);
+    subtest("resets of request streams", test_h3_reliable_reset);
 }
