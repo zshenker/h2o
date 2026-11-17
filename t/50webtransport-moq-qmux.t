@@ -255,6 +255,8 @@ if ($RELAY_UNIX) {
     my $dir = tempdir(CLEANUP => 1);
     $relay_listener = IO::Socket::UNIX->new(Local => "$dir/relay-moqt-22-0.sock", Type => SOCK_STREAM, Listen => 5)
         or die "failed to listen:$!";
+    # the same relay serves every draft
+    symlink "$dir/relay-moqt-22-0.sock", "$dir/relay-$_-0.sock" or die "symlink failed:$!" for qw(moqt-20 moqt-21 moqt-23);
     $relay_conf = "url: unix:$dir/relay-{alpn}-{thread}.sock";
 } else {
     $relay_listener = IO::Socket::INET->new(
