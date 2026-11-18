@@ -97,6 +97,7 @@ struct st_wtmoq_thread_ctx_t {
     quicly_context_t quic;
     quicly_stream_open_t stream_open;
     quicly_receive_datagram_frame_t receive_datagram_frame;
+    quicly_closed_t closed;
     h2o_quic_ctx_t quic_ctx;
 };
 
@@ -909,31 +910,54 @@ static void wt_close(struct st_wtmoq_session_t *session, uint64_t code, const ch
     send_session_close(session, code <= UINT32_MAX ? (uint32_t)code : 0, reason, strlen(reason));
 }
 
+/**
+ * Ends the session of a backend connection that is going away without the session having closed it (see `close_backend`): fails the
+ * session if it has not been established, or closes it with the application error code of the relay's CONNECTION_CLOSE, if any.
+ */
+static void detach_session_on_backend_gone(struct st_wtmoq_backend_t *backend)
+{
+    struct st_wtmoq_session_t *session = backend->session;
+
+    if (session == NULL)
+        return;
+    session->backend = NULL;
+    backend->session = NULL;
+    if (!session->established) {
+        fail_session(session, "backend connection failed");
+    } else {
+        uint64_t code = 0;
+        const char *reason = "";
+        if (quicly_get_state(backend->super.quic) >= QUICLY_STATE_CLOSING) {
+            quicly_error_t err = quicly_get_close_reason(backend->super.quic, NULL, &reason, NULL);
+            if (QUICLY_ERROR_IS_QUIC_APPLICATION(err))
+                code = QUICLY_ERROR_GET_ERROR_CODE(err);
+            if (reason == NULL)
+                reason = "";
+        }
+        terminate_session_streams(session);
+        session->frontend_cb->close(session, code, reason);
+    }
+}
+
+/**
+ * Called by quicly when the backend connection enters the closing or draining state, before it destroys the streams. When the relay
+ * has closed the connection, quicly destroys the streams with its application error code, which the pairs would pass to the client
+ * as stream resets ahead of the session being closed; therefore, the session is closed and the pairs detached here first.
+ */
+static void on_backend_closed(quicly_closed_t *self, quicly_conn_t *quic)
+{
+    h2o_quic_conn_t *conn = *quicly_get_data(quic);
+
+    if (conn != NULL)
+        detach_session_on_backend_gone((struct st_wtmoq_backend_t *)conn);
+}
+
 static void on_backend_destroy(h2o_quic_conn_t *_backend)
 {
     struct st_wtmoq_backend_t *backend = (void *)_backend;
-    struct st_wtmoq_session_t *session = backend->session;
 
-    if (session != NULL) {
-        session->backend = NULL;
-        backend->session = NULL;
-        if (!session->established) {
-            fail_session(session, "backend connection failed");
-        } else {
-            /* the relay has closed the connection; close the session with the application error code */
-            uint64_t code = 0;
-            const char *reason = "";
-            if (quicly_get_state(backend->super.quic) >= QUICLY_STATE_CLOSING) {
-                quicly_error_t err = quicly_get_close_reason(backend->super.quic, NULL, &reason, NULL);
-                if (QUICLY_ERROR_IS_QUIC_APPLICATION(err))
-                    code = QUICLY_ERROR_GET_ERROR_CODE(err);
-                if (reason == NULL)
-                    reason = "";
-            }
-            terminate_session_streams(session);
-            session->frontend_cb->close(session, code, reason);
-        }
-    }
+    /* the relay went away without closing the connection (e.g., the socket of a QMux connection was closed) */
+    detach_session_on_backend_gone(backend);
 
     /* destroys the streams, which in turn abort their peers */
     h2o_quic_dispose_conn(&backend->super);
@@ -1374,6 +1398,8 @@ static struct st_wtmoq_thread_ctx_t *create_thread_ctx(h2o_context_t *ctx)
     tctx->quic.transport_params.max_idle_timeout = 0;
     tctx->stream_open = (quicly_stream_open_t){on_backend_stream_open};
     tctx->quic.stream_open = &tctx->stream_open;
+    tctx->closed = (quicly_closed_t){on_backend_closed};
+    tctx->quic.closed = &tctx->closed;
     tctx->receive_datagram_frame = (quicly_receive_datagram_frame_t){on_backend_datagram};
     tctx->quic.receive_datagram_frame = &tctx->receive_datagram_frame;
     tctx->quic.qmux_writable = &h2o_quic_qmux_writable;
