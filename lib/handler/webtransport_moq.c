@@ -487,7 +487,8 @@ static void on_send_emit(quicly_stream_t *qs, size_t off, void *_dst, size_t *le
     size_t n = src->bytes_ready - src_off;
     if (n > dst_end - dst)
         n = dst_end - dst;
-    memcpy(dst, src->recvbuf->bytes + src_off, n);
+    if (n != 0) /* the receive buffer has nothing allocated until the first bytes arrive */
+        memcpy(dst, src->recvbuf->bytes + src_off, n);
     dst += n;
 
     *len = dst - (uint8_t *)_dst;
