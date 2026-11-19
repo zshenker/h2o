@@ -44,6 +44,8 @@
 #define MAX_STREAMS 100
 #define STREAM_WINDOW (1024 * 1024)
 #define CONNECT_TIMEOUT 10000 /* in milliseconds */
+#define CLOSE_ACK_TIMEOUT 3000 /* in milliseconds; how long the streams toward the client wait for the close to be acknowledged */
+#define CLOSE_ACK_POLL 10      /* in milliseconds */
 #define MAX_CAPSULE_SIZE 16384
 #define MAX_DATAGRAM_FRAME_SIZE 1500 /* advertised to the relay; same as what h2o advertises to the client */
 
@@ -203,7 +205,9 @@ struct st_wtmoq_frontend_t {
      */
     void (*on_connect_failed)(struct st_wtmoq_session_t *session, const char *errstr);
     /**
-     * ends the session, as the relay has closed the connection with `code` and `reason`
+     * ends the session, as the relay has closed the connection with `code` and `reason`; terminates the streams toward the client
+     * (see `terminate_session_streams`), which have been detached from those of the relay, once the client can no longer see their
+     * resets before the close
      */
     void (*close)(struct st_wtmoq_session_t *session, uint64_t code, const char *reason);
     /**
@@ -269,6 +273,14 @@ struct st_wtmoq_session_t {
      */
     unsigned terminated : 1;
     unsigned disposed : 1;
+    /**
+     * set once CLOSE_WEBTRANSPORT_SESSION has been sent for the relay's close; the streams toward the client are terminated once it
+     * has been acknowledged (polled by `close_acked_timer`), or `CLOSE_ACK_TIMEOUT` has passed, as a client that sees the resets of
+     * its streams first (e.g., its MoQ control stream) might never see the close
+     */
+    unsigned closing : 1;
+    h2o_timer_t close_acked_timer;
+    uint64_t close_acked_deadline;
 };
 
 static void close_backend(struct st_wtmoq_session_t *session, uint64_t code, const char *reason);
@@ -637,7 +649,7 @@ static quicly_error_t on_frontend_stream_open(h2o_req_t *req, quicly_stream_t *q
     assert(type != UINT64_MAX);
     if (type != (unidirectional ? WT_STREAM_TYPE_UNI : WT_SIGNAL_BIDI))
         return H2O_HTTP3_ERROR_DECLINED;
-    if (!session->established || session->terminated)
+    if (!session->established || session->terminated || session->closing)
         return WT_ERROR_BUFFERED_STREAM_REJECTED;
 
     /* take the stream, consuming the type */
@@ -906,9 +918,48 @@ static void wt_on_connect_failed(struct st_wtmoq_session_t *session, const char 
     h2o_send_error_502(session->req, "Bad Gateway", errstr, 0);
 }
 
+/**
+ * Terminates the streams toward the client once CLOSE_WEBTRANSPORT_SESSION, sent for the relay's close, has been acknowledged, which
+ * is when the request stream's send side has been acknowledged in full (or the stream is gone), or once `CLOSE_ACK_TIMEOUT` has passed.
+ */
+static void on_close_acked_timer(h2o_timer_t *timer)
+{
+    struct st_wtmoq_session_t *session = H2O_STRUCT_FROM_MEMBER(struct st_wtmoq_session_t, close_acked_timer, timer);
+    h2o_loop_t *loop = session->tctx->ctx->loop;
+    quicly_stream_t *qs = quicly_get_stream(session->frontend, session->session_id);
+
+    if (qs != NULL && !quicly_sendstate_transfer_complete(&qs->sendstate) && h2o_now(loop) < session->close_acked_deadline) {
+        h2o_timer_link(loop, CLOSE_ACK_POLL, &session->close_acked_timer);
+        return;
+    }
+    terminate_session_streams(session);
+}
+
 static void wt_close(struct st_wtmoq_session_t *session, uint64_t code, const char *reason)
 {
     send_session_close(session, code <= UINT32_MAX ? (uint32_t)code : 0, reason, strlen(reason));
+    /* the streams toward the client are terminated once the client has the close (see `closing`) */
+    session->closing = 1;
+    session->close_acked_deadline = h2o_now(session->tctx->ctx->loop) + CLOSE_ACK_TIMEOUT;
+    on_close_acked_timer(&session->close_acked_timer);
+}
+
+/**
+ * Detaches the streams toward the client from those of the relay, which are about to be destroyed, so that they are not aborted
+ * with the relay's error codes; the frontend terminates them as it closes the session (see `st_wtmoq_frontend_t::close`). The bytes
+ * received from the relay are retained, as they might still be emitted toward the client.
+ */
+static void detach_backend_halves(struct st_wtmoq_session_t *session)
+{
+    for (h2o_linklist_t *l = session->pairs.next; l != &session->pairs; l = l->next) {
+        struct st_wtmoq_pair_t *pair = H2O_STRUCT_FROM_MEMBER(struct st_wtmoq_pair_t, link, l);
+        quicly_stream_t *qs;
+        if ((qs = pair->backend.quic) != NULL) {
+            qs->callbacks = &quicly_stream_noop_callbacks;
+            qs->data = NULL;
+            pair->backend.quic = NULL;
+        }
+    }
 }
 
 /**
@@ -935,7 +986,7 @@ static void detach_session_on_backend_gone(struct st_wtmoq_backend_t *backend)
             if (reason == NULL)
                 reason = "";
         }
-        terminate_session_streams(session);
+        detach_backend_halves(session);
         session->frontend_cb->close(session, code, reason);
     }
 }
@@ -1147,6 +1198,7 @@ static void dispose_session(struct st_wtmoq_session_t *session)
 
     cancel_connect(session);
     h2o_timer_unlink(&session->connect_timeout);
+    h2o_timer_unlink(&session->close_acked_timer);
 
     /* terminate the streams on the client connection; the backend ones are destroyed with the connection */
     terminate_session_streams(session);
@@ -1241,6 +1293,7 @@ static void init_session(struct st_wtmoq_session_t *session)
     h2o_buffer_init(&session->resp.pending, &h2o_socket_buffer_prototype);
     h2o_buffer_init(&session->resp.inflight, &h2o_socket_buffer_prototype);
     h2o_timer_init(&session->connect_timeout, on_connect_timeout);
+    h2o_timer_init(&session->close_acked_timer, on_close_acked_timer);
 }
 
 /**
@@ -1565,6 +1618,8 @@ static void native_on_connect_failed(struct st_wtmoq_session_t *session, const c
 
 static void native_close(struct st_wtmoq_session_t *session, uint64_t code, const char *reason)
 {
+    /* CONNECTION_CLOSE ends the streams as well; nothing can arrive ahead of it */
+    terminate_session_streams(session);
     h2o_quic_close_connection(native_get_conn(session), QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(code), reason);
 }
 
