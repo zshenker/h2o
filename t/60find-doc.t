@@ -8,7 +8,10 @@ use t::Util;
 my @private_commands = (
     qw(mruby.handler_path proxy.connect.proxy-status proxy.http2.max-concurrent_streams proxy.max-spare-pipes proxy-status.identity), # deprecated
     qw(header.cookie.unset header.cookie.unsetunless), # removing "cookie" headers in response?
-    qw(http3-ack-frequency http3-allow-delayed-ack quic-nodes self-trace), # highly experimental and therefore undocumented
+    qw(http3-ack-frequency http3-allow-delayed-ack proxy.h3qx.force-cleartext proxy.h3qx.ratio quic-nodes self-trace), # highly
+        # experimental and therefore undocumented
+    qw(webtransport webtransport.moq), # experimental and therefore undocumented
+    qw(quic-client-rcvbuf quic-client-sndbuf), # to be documented once settled
 );
 
 my $tempdir = tempdir(CLEANUP => 1);

@@ -624,6 +624,16 @@ static int on_config_http3_input_window_size(h2o_configurator_command_t *cmd, h2
     return 0;
 }
 
+static int on_config_quic_client_sndbuf(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return h2o_configurator_scanf(cmd, node, "%u", &ctx->globalconf->http3.client_socket.sndbuf);
+}
+
+static int on_config_quic_client_rcvbuf(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    return h2o_configurator_scanf(cmd, node, "%u", &ctx->globalconf->http3.client_socket.rcvbuf);
+}
+
 static int on_config_http3_ack_frequency(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
 {
     double v;
@@ -645,6 +655,16 @@ static int on_config_http3_allow_delayed_ack(h2o_configurator_command_t *cmd, h2
     if ((on = h2o_configurator_get_one_of(cmd, node, "OFF,ON")) == -1)
         return -1;
     ctx->globalconf->http3.allow_delayed_ack = (uint8_t)on;
+    return 0;
+}
+
+static int on_config_webtransport(h2o_configurator_command_t *cmd, h2o_configurator_context_t *ctx, yoml_t *node)
+{
+    ssize_t on;
+
+    if ((on = h2o_configurator_get_one_of(cmd, node, "OFF,ON")) == -1)
+        return -1;
+    ctx->globalconf->http3.webtransport = (uint8_t)on;
     return 0;
 }
 
@@ -1133,6 +1153,12 @@ void h2o_configurator__init_core(h2o_globalconf_t *conf)
         h2o_configurator_define_command(&c->super, "http3-input-window-size",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http3_input_window_size);
+        h2o_configurator_define_command(&c->super, "quic-client-sndbuf",
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_quic_client_sndbuf);
+        h2o_configurator_define_command(&c->super, "quic-client-rcvbuf",
+                                        H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_quic_client_rcvbuf);
         h2o_configurator_define_command(&c->super, "http3-ack-frequency",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http3_ack_frequency);
@@ -1141,6 +1167,8 @@ void h2o_configurator__init_core(h2o_globalconf_t *conf)
                                         on_config_http3_allow_delayed_ack);
         h2o_configurator_define_command(&c->super, "http3-gso", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http3_gso);
+        h2o_configurator_define_command(&c->super, "webtransport", H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
+                                        on_config_webtransport);
         h2o_configurator_define_command(&c->super, "http3-max-concurrent-streaming-requests-per-connection",
                                         H2O_CONFIGURATOR_FLAG_GLOBAL | H2O_CONFIGURATOR_FLAG_EXPECT_SCALAR,
                                         on_config_http3_max_concurrent_streaming_requests_per_connection);

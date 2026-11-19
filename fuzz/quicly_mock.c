@@ -149,6 +149,13 @@ void quicly_reset_stream(quicly_stream_t *stream, quicly_error_t err)
     scheduler->update_state(scheduler, stream);
 }
 
+quicly_error_t quicly_set_reset_stream_at(quicly_stream_t *stream, quicly_error_t err, uint64_t reliable_size)
+{
+    if (!stream->conn->super.remote.transport_params.reset_stream_at)
+        return PTLS_ERROR_NOT_AVAILABLE;
+    return quicly_sendstate_reset(&stream->sendstate, QUICLY_ERROR_GET_ERROR_CODE(err), reliable_size);
+}
+
 socklen_t quicly_get_socklen(struct sockaddr *sa)
 {
     switch (sa->sa_family) {
@@ -536,6 +543,24 @@ void quicly_get_max_data(quicly_conn_t *conn, uint64_t *send_permitted, uint64_t
 quicly_error_t quicly_send_resumption_token(quicly_conn_t *conn)
 {
     return 0;
+}
+
+quicly_error_t quicly_qmux_send(quicly_conn_t *conn, void *buf, size_t *bufsize)
+{
+    assert(0 && "unimplemented");
+    return 1;
+}
+
+quicly_error_t quicly_qmux_receive(quicly_conn_t *conn, const void *src, size_t *len)
+{
+    assert(0 && "unimplemented");
+    return 1;
+}
+
+quicly_conn_t *quicly_qmux_new(quicly_context_t *ctx, int is_client, void *appdata)
+{
+    assert(0 && "unimplemented");
+    return NULL;
 }
 
 const uint32_t quicly_supported_versions[] = {QUICLY_PROTOCOL_VERSION_1, QUICLY_PROTOCOL_VERSION_DRAFT29,

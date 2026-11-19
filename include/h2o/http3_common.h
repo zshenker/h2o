@@ -59,6 +59,8 @@
 #define H2O_HTTP3_SETTINGS_ENABLE_CONNECT_PROTOCOL 8
 #define H2O_HTTP3_SETTINGS_H3_DATAGRAM_DRAFT03 0x276
 #define H2O_HTTP3_SETTINGS_H3_DATAGRAM 0x33
+#define H2O_HTTP3_SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 0x2b603742
+#define H2O_HTTP3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07 0xc671706a
 
 #define H2O_HTTP3_ERROR_NONE QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x100)
 #define H2O_HTTP3_ERROR_GENERAL_PROTOCOL QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x101)
@@ -88,6 +90,7 @@
 
 #define H2O_HTTP3_ERROR_INCOMPLETE -1
 #define H2O_HTTP3_ERROR_TRANSPORT -2
+#define H2O_HTTP3_ERROR_DECLINED -3 /* returned by `on_stream_open` of `h2o_req_t::open_extended_http3` */
 #define H2O_HTTP3_ERROR_USER1 -256
 
 #define H2O_HTTP3_DEFAULT_MAX_CONCURRENT_STREAMING_REQUESTS 1
@@ -293,7 +296,22 @@ struct st_h2o_quic_conn_t {
      *
      */
     uint64_t _accept_hashkey;
+    /**
+     * unless set to NULL, the connection is QUIC on Streams using `streams_sock` as the underlying socket
+     */
+    h2o_socket_t *streams_sock;
+    /**
+     * the record being written to `streams_sock` (of H2O_QUIC_STREAMS_SENDBUF_SIZE bytes, allocated on first use);
+     * `h2o_socket_write` does not copy the data, which therefore has to remain until the write completes
+     */
+    uint8_t *_streams_sendbuf;
 };
+
+/**
+ * size of `h2o_quic_conn_t::_streams_sendbuf`; holds one QMux record, which is the 2-byte header and up to 16382 bytes (the maximum
+ * record size of quicly)
+ */
+#define H2O_QUIC_STREAMS_SENDBUF_SIZE 16384
 
 typedef struct st_h2o_http3_qpack_context_t {
     /**
@@ -311,6 +329,14 @@ typedef struct st_h2o_http3_conn_callbacks_t {
     h2o_quic_conn_callbacks_t super;
     void (*handle_control_stream_frame)(h2o_http3_conn_t *conn, uint64_t type, const uint8_t *payload, size_t len);
     void (*qpack_unblock_streams)(h2o_http3_conn_t *conn, uint64_t insert_count);
+    /**
+     * Optional. Called with a unidirectional stream opened by the peer whose type is not one HTTP/3 or QPACK defines, once the type
+     * has been received but before any byte is consumed; `*recvbuf` holds the bytes from the beginning of the stream. Returns 0 if
+     * the callee has taken the stream (having replaced `qs->callbacks` and `qs->data`, and taken `*recvbuf`),
+     * H2O_HTTP3_ERROR_DECLINED to have the stream refused with H3_STREAM_CREATION_ERROR as when the callback is absent, or an
+     * application error code to have it refused with that code.
+     */
+    quicly_error_t (*on_extension_unistream)(h2o_http3_conn_t *conn, quicly_stream_t *qs, h2o_buffer_t **recvbuf);
 } h2o_http3_conn_callbacks_t;
 
 struct st_h2o_http3_conn_t {
@@ -336,7 +362,20 @@ struct st_h2o_http3_conn_t {
     struct {
         uint64_t max_field_section_size;
         unsigned h3_datagram : 1;
+        /**
+         * if SETTINGS_ENABLE_WEBTRANSPORT of draft-02 has been received with a value of 1
+         */
+        unsigned webtransport : 1;
     } peer_settings;
+    /**
+     * SETTINGS sent in addition to the default ones; to be set before calling `h2o_http3_setup`
+     */
+    struct {
+        /**
+         * advertise SETTINGS_ENABLE_WEBTRANSPORT of draft-02, and SETTINGS_WEBTRANSPORT_MAX_SESSIONS of draft-07 with a value of 1
+         */
+        unsigned webtransport : 1;
+    } local_settings;
     struct {
         struct {
             struct st_h2o_http3_ingress_unistream_t *control;
@@ -405,9 +444,9 @@ int h2o_http3_read_frame(h2o_http3_read_frame_t *frame, int is_client, uint64_t 
                          const uint8_t **src, const uint8_t *src_end, const char **err_desc);
 
 /**
- * a helper function that opens an unbound UDP socket
+ * a helper function that opens an unbound UDP socket; `sndbuf` and `rcvbuf` set SO_SNDBUF and SO_RCVBUF unless zero
  */
-h2o_socket_t *h2o_quic_create_client_socket(h2o_loop_t *loop, int family);
+h2o_socket_t *h2o_quic_create_client_socket(h2o_loop_t *loop, int family, unsigned sndbuf, unsigned rcvbuf);
 /**
  * Initializes the QUIC context, binding the event loop, socket, quic, and other properties. `next_cid` should be a thread-local
  * that contains the CID seed to be used; see `h2o_quic_ctx_t::next_cid` for more information.
@@ -451,9 +490,19 @@ void h2o_quic_init_conn(h2o_quic_conn_t *conn, h2o_quic_ctx_t *ctx, const h2o_qu
  */
 void h2o_quic_dispose_conn(h2o_quic_conn_t *conn);
 /**
+ * Prepares `to`, initialized by `h2o_quic_init_conn` with the same context, to take over the QUIC connection of `from`, which must
+ * not be QUIC on Streams. Returns the QUIC connection, to be set up with `to` right away by `h2o_quic_setup` (or
+ * `h2o_http3_setup`). `from` no longer refers to it, and is to be disposed of without closing it.
+ */
+quicly_conn_t *h2o_quic_hand_over(h2o_quic_conn_t *from, h2o_quic_conn_t *to);
+/**
  *
  */
-void h2o_quic_setup(h2o_quic_conn_t *conn, quicly_conn_t *quic);
+void h2o_quic_setup(h2o_quic_conn_t *conn, quicly_conn_t *quic, h2o_socket_t *streams_sock);
+
+extern quicly_qmux_writable_t h2o_quic_qmux_writable;
+extern quicly_qmux_log_state_t h2o_quic_qmux_log_state;
+
 /**
  * initializes a http3 connection
  */
@@ -466,7 +515,7 @@ void h2o_http3_dispose_conn(h2o_http3_conn_t *conn);
 /**
  *
  */
-quicly_error_t h2o_http3_setup(h2o_http3_conn_t *conn, quicly_conn_t *quic);
+quicly_error_t h2o_http3_setup(h2o_http3_conn_t *conn, quicly_conn_t *quic, h2o_socket_t *streams_sock);
 /**
  * sends packets immediately by calling quicly_send, sendmsg (returns true if success, false if the connection was destroyed)
  */

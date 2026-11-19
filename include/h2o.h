@@ -488,6 +488,13 @@ struct st_h2o_globalconf_t {
          */
         uint16_t ack_frequency;
         /**
+         * SO_SNDBUF and SO_RCVBUF of the UDP sockets that h2o opens as a QUIC client (e.g., toward HTTP/3 upstreams), or 0 to use
+         * the default of the kernel
+         */
+        struct {
+            unsigned sndbuf, rcvbuf;
+        } client_socket;
+        /**
          * a boolean indicating if the delayed ack extension should be used (default true)
          */
         uint8_t allow_delayed_ack : 1;
@@ -499,6 +506,16 @@ struct st_h2o_globalconf_t {
          * maximum number of HTTP3 streaming requests (per connection) to be handled simultaneously internally.
          */
         size_t max_concurrent_streaming_requests_per_connection;
+        /**
+         * if SETTINGS_ENABLE_WEBTRANSPORT of draft-02 is advertised on every HTTP/3 connection
+         */
+        uint8_t webtransport : 1;
+        /**
+         *
+         */
+        struct {
+            h2o_http3_qpack_context_t qpack;
+        } qmux;
     } http3;
 
     struct {
@@ -791,6 +808,13 @@ struct st_h2o_context_t {
              */
             uint64_t forwarded_packet_received;
         } events;
+        /**
+         *
+         */
+        struct {
+            quicly_context_t _quicly;
+            h2o_quic_ctx_t quic;
+        } qmux;
     } http3;
 
     struct {
@@ -814,6 +838,7 @@ struct st_h2o_context_t {
          */
         uint64_t alpn_h1;
         uint64_t alpn_h2;
+        uint64_t alpn_h3qx;
         /**
          * counter for handshakes
          */
@@ -1472,6 +1497,33 @@ struct st_h2o_req_t {
         h2o_forward_datagram_cb write_, read_;
     } forward_datagram;
 
+    /**
+     * Set by the protocol layer for extended CONNECT requests on HTTP/3; NULL otherwise. Lets the request extend the HTTP/3
+     * connection: returns the QUIC connection, through which the handler opens streams with `quicly_open_stream`, scheduled
+     * together with the request stream. Thereafter, streams that the peer opens and HTTP/3 does not recognize are passed to
+     * `on_stream_open`, which takes them by returning 0, refuses them by returning an error code, or returns
+     * H2O_HTTP3_ERROR_DECLINED to leave them to HTTP/3. The handler's context is `write_req.ctx`, as for
+     * `forward_datagram.write_`. Returns NULL if the connection is already extended. The extension ends when the request is
+     * disposed.
+     *
+     * Streams are offered once their first varint (the stream type of a unidirectional stream, of a type HTTP/3 does not define;
+     * or the first frame type of a bidirectional stream) has been received, before HTTP/3 consumes any byte. `*recvbuf` holds the
+     * received bytes starting at `qs->recvstate.data_off`, i.e., from the beginning of the stream, the first varint included;
+     * only `quicly_recvstate_bytes_available` of them are valid. The callee decodes them, and when taking the stream, sets
+     * `qs->callbacks` and `qs->data`, and takes `*recvbuf` (setting it to NULL), consuming the bytes as it sees fit. When
+     * declining, it leaves `*recvbuf` untouched. The stream might have ended already.
+     *
+     * The streams of the extension, i.e., those the handler opens or takes, are sent when the request stream would be, ordered
+     * among themselves by `scheduler`, or by quicly's default scheduler if `scheduler` is NULL. `scheduler` is called for them
+     * until the extension ends; it then stops being used, and the streams that remain are left to quicly's default scheduler.
+     * Therefore, `scheduler` has to remain valid until the request is disposed, and must not use the fields of the streams that
+     * quicly's default scheduler uses (`_send_aux.pending_link.default_scheduler`).
+     */
+    struct st_h2o_quic_conn_t *(*open_extended_http3)(h2o_req_t *req,
+                                                      quicly_error_t (*on_stream_open)(h2o_req_t *req, quicly_stream_t *qs,
+                                                                                       h2o_buffer_t **recvbuf),
+                                                      quicly_stream_scheduler_t *scheduler);
+
     /* internal structure */
     h2o_generator_t *_generator;
     h2o_ostream_t *_ostr_top;
@@ -1497,6 +1549,8 @@ extern const char h2o_http2_npn_protocols[];
 extern const char h2o_npn_protocols[];
 extern const h2o_iovec_t h2o_http2_alpn_protocols[];
 extern const h2o_iovec_t h2o_alpn_protocols[];
+extern const h2o_iovec_t h2o_h3qx_alpn_protocols[];
+extern const h2o_iovec_t h2o_alpn_protocols_including_h3qx[];
 
 /**
  * accepts a connection
@@ -2331,6 +2385,9 @@ typedef struct st_h2o_proxy_config_vars_t {
         uint64_t max_concurrent_streams;
         unsigned ecn : 1;
     } http3;
+    struct {
+        unsigned force_cleartext : 1;
+    } h3qx;
     h2o_httpclient_protocol_ratio_t protocol_ratio;
 } h2o_proxy_config_vars_t;
 
@@ -2459,6 +2516,22 @@ void h2o_self_trace_register(h2o_pathconf_t *conf);
  *
  */
 void h2o_self_trace_register_configurator(h2o_globalconf_t *conf);
+
+/* lib/handler/webtransport_moq.c */
+/**
+ * registers the handler forwarding MoQ sessions received over WebTransport to a MoQ relay over native QUIC (`host`:`port`), or, if
+ * `qmux_cleartext` is set (for testing), over QMux on cleartext TCP
+ */
+void h2o_webtransport_moq_register(h2o_pathconf_t *pathconf, h2o_iovec_t host, uint16_t port, int qmux_cleartext);
+/**
+ * as `h2o_webtransport_moq_register`, but connects to the relay using QMux over the Unix socket at `path`, in which `{alpn}` is
+ * replaced by the session's MoQ draft, and `{thread}` by the index of the worker thread
+ */
+void h2o_webtransport_moq_register_unix(h2o_pathconf_t *pathconf, const char *path);
+/**
+ * registers the configurator of the webtransport.moq directive
+ */
+void h2o_webtransport_moq_register_configurator(h2o_globalconf_t *conf);
 
 /* lib/handler/h2olog.c */
 

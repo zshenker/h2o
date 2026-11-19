@@ -78,7 +78,7 @@ static void report_sendmsg_errors(h2o_error_reporter_t *reporter, uint64_t total
 static h2o_error_reporter_t track_sendmsg = H2O_ERROR_REPORTER_INITIALIZER(report_sendmsg_errors);
 
 #if !H2O_USE_LIBUV
-h2o_socket_t *h2o_quic_create_client_socket(h2o_loop_t *loop, int family)
+h2o_socket_t *h2o_quic_create_client_socket(h2o_loop_t *loop, int family, unsigned sndbuf, unsigned rcvbuf)
 {
     int fd, on = 1;
     quicly_address_t addr = {.sa.sa_family = family};
@@ -86,6 +86,13 @@ h2o_socket_t *h2o_quic_create_client_socket(h2o_loop_t *loop, int family)
 
     if ((fd = socket(family, SOCK_DGRAM, 0)) == -1)
         return NULL;
+
+    /* As a socket is shared by the connections of a thread, the default of the kernel might not be large enough. The kernel caps the
+     * values at net.core.{w,r}mem_max. */
+    if (sndbuf != 0 && setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf)) != 0)
+        h2o_perror("failed to set SO_SNDBUF");
+    if (rcvbuf != 0 && setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf)) != 0)
+        h2o_perror("failed to set SO_RCVBUF");
 
     switch (family) {
     case AF_INET:
@@ -291,6 +298,7 @@ static void ingress_unistream_on_destroy(quicly_stream_t *qs, quicly_error_t err
     free(stream);
 }
 
+
 static void ingress_unistream_on_receive(quicly_stream_t *qs, size_t off, const void *input, size_t len)
 {
     h2o_http3_conn_t *conn = *quicly_get_data(qs->conn);
@@ -308,6 +316,8 @@ static void ingress_unistream_on_receive(quicly_stream_t *qs, size_t off, const 
 
     /* handle the bytes */
     stream->handle_input(conn, stream, &src, src + bytes_available, quicly_recvstate_transfer_complete(&stream->quic->recvstate));
+    if (qs->data != stream)
+        return; /* taken by the extension of the connection, and `stream` has been freed */
     if (stream->bytes_received != NULL && *stream->bytes_received < bytes_received)
         *stream->bytes_received = bytes_received;
     if (quicly_get_state(conn->super.quic) >= QUICLY_STATE_CLOSING)
@@ -437,10 +447,19 @@ static void unknown_type_handle_input(h2o_http3_conn_t *conn, struct st_h2o_http
         stream->bytes_received = &conn->stats.bytes_received.qpack_decoder;
         stream->handle_input = qpack_decoder_stream_handle_input;
         break;
-    default:
-        quicly_request_stop(stream->quic, H2O_HTTP3_ERROR_STREAM_CREATION);
+    default: {
+        quicly_error_t ret = H2O_HTTP3_ERROR_DECLINED;
+        /* offer the stream to the extension of the connection, with the receive buffer untouched (i.e., the type included) */
+        if (get_callbacks(conn)->on_extension_unistream != NULL &&
+            (ret = get_callbacks(conn)->on_extension_unistream(conn, stream->quic, &stream->recvbuf)) == 0) {
+            /* taken; the caller notices that `qs->data` no longer points to `stream` */
+            assert(stream->recvbuf == NULL);
+            free(stream);
+            return;
+        }
+        quicly_request_stop(stream->quic, ret == H2O_HTTP3_ERROR_DECLINED ? H2O_HTTP3_ERROR_STREAM_CREATION : ret);
         stream->handle_input = discard_handle_input;
-        break;
+    } break;
     }
 
     return stream->handle_input(conn, stream, src, src_end, is_eos);
@@ -486,15 +505,16 @@ static void egress_unistream_on_send_stop(quicly_stream_t *qs, quicly_error_t er
     h2o_quic_close_connection(&conn->super, H2O_HTTP3_ERROR_CLOSED_CRITICAL_STREAM, NULL);
 }
 
+const quicly_stream_callbacks_t h2o_http3_egress_unistream_callbacks = {egress_unistream_on_destroy, egress_unistream_on_send_shift,
+                                                                         egress_unistream_on_send_emit, egress_unistream_on_send_stop};
+
 void h2o_http3_on_create_unidirectional_stream(quicly_stream_t *qs)
 {
     if (quicly_stream_is_self_initiated(qs)) {
         /* create egress unistream */
-        static const quicly_stream_callbacks_t callbacks = {egress_unistream_on_destroy, egress_unistream_on_send_shift,
-                                                            egress_unistream_on_send_emit, egress_unistream_on_send_stop};
         struct st_h2o_http3_egress_unistream_t *stream = h2o_mem_alloc(sizeof(*stream));
         qs->data = stream;
-        qs->callbacks = &callbacks;
+        qs->callbacks = &h2o_http3_egress_unistream_callbacks;
         stream->quic = qs;
         stream->bytes_sent = NULL;
         h2o_buffer_init(&stream->sendbuf, &h2o_socket_buffer_prototype);
@@ -761,10 +781,13 @@ static void process_packets(h2o_quic_ctx_t *ctx, quicly_address_t *destaddr, qui
         }
     }
 
-    /* receive packets to the found connection */
+    /* Receive packets to the found connection. The connection might be handed over to another `h2o_quic_conn_t` while receiving
+     * (see `h2o_quic_hand_over`); therefore, it is looked up again after each packet. */
+    quicly_conn_t *quic = conn->quic;
     for (size_t i = 0; i != num_packets; ++i) {
         if (i != accepted_packet_index) {
-            quicly_error_t ret = quicly_receive(conn->quic, &destaddr->sa, &srcaddr->sa, packets + i);
+            quicly_error_t ret = quicly_receive(quic, &destaddr->sa, &srcaddr->sa, packets + i);
+            conn = *quicly_get_data(quic);
             switch (ret) {
             case 0:
                 if (ctx->quic_stats != NULL)
@@ -1243,18 +1266,104 @@ void h2o_quic_init_conn(h2o_quic_conn_t *conn, h2o_quic_ctx_t *ctx, const h2o_qu
 void h2o_quic_dispose_conn(h2o_quic_conn_t *conn)
 {
     if (conn->quic != NULL) {
-        khiter_t iter;
-        /* unregister from maps */
-        if ((iter = kh_get_h2o_quic_idmap(conn->ctx->conns_by_id, quicly_get_master_id(conn->quic)->master_id)) !=
-            kh_end(conn->ctx->conns_by_id))
-            kh_del_h2o_quic_idmap(conn->ctx->conns_by_id, iter);
-        drop_from_acceptmap(conn->ctx, conn);
+        if (conn->streams_sock == NULL) {
+            khiter_t iter;
+            /* unregister from maps */
+            if ((iter = kh_get_h2o_quic_idmap(conn->ctx->conns_by_id, quicly_get_master_id(conn->quic)->master_id)) !=
+                kh_end(conn->ctx->conns_by_id))
+                kh_del_h2o_quic_idmap(conn->ctx->conns_by_id, iter);
+            drop_from_acceptmap(conn->ctx, conn);
+        }
         quicly_free(conn->quic);
     }
+    if (conn->streams_sock != NULL)
+        h2o_socket_close(conn->streams_sock);
+    free(conn->_streams_sendbuf);
     h2o_timer_unlink(&conn->_timeout);
 }
 
-void h2o_quic_setup(h2o_quic_conn_t *conn, quicly_conn_t *quic)
+static void qmux_on_read(h2o_socket_t *sock, const char *err)
+{
+    h2o_quic_conn_t *conn = sock->data;
+    assert(conn->streams_sock != NULL);
+
+    if (err != NULL) {
+        conn->callbacks->destroy_connection(conn);
+        return;
+    }
+
+    size_t len = sock->input->size;
+    quicly_error_t ret = quicly_qmux_receive(conn->quic, sock->input->bytes, &len);
+    switch (ret) {
+    case QUICLY_ERROR_STATE_EXHAUSTION:
+    case PTLS_ERROR_NO_MEMORY:
+        conn->callbacks->destroy_connection(conn);
+        return;
+    default:
+        break;
+    }
+    h2o_buffer_consume(&sock->input, len);
+
+    h2o_quic_schedule_timer(conn);
+}
+
+static void qmux_on_write_complete(h2o_socket_t *sock, const char *err)
+{
+    h2o_quic_conn_t *conn = sock->data;
+    assert(conn->streams_sock != NULL);
+
+    if (err != NULL) {
+        conn->callbacks->destroy_connection(conn);
+        return;
+    }
+
+    h2o_quic_schedule_timer(conn);
+}
+
+static int qmux_writable(quicly_qmux_writable_t *_self, quicly_conn_t *quic)
+{
+    h2o_quic_conn_t *conn = *quicly_get_data(quic);
+    assert(conn->streams_sock != NULL);
+
+    return !h2o_socket_is_writing(conn->streams_sock);
+}
+
+quicly_qmux_writable_t h2o_quic_qmux_writable = {.cb = qmux_writable};
+
+static ptls_log_conn_state_t *qmux_log_state(quicly_qmux_log_state_t *_self, quicly_conn_t *quic, ptls_log_getsni_t *getsni)
+{
+    h2o_quic_conn_t *conn = *quicly_get_data(quic);
+    assert(conn->streams_sock != NULL);
+
+    *getsni = ptls_log_getsni_h2o_sock(conn->streams_sock);
+    return h2o_socket_log_state(conn->streams_sock);
+}
+
+quicly_qmux_log_state_t h2o_quic_qmux_log_state = {.cb = qmux_log_state};
+
+quicly_conn_t *h2o_quic_hand_over(h2o_quic_conn_t *from, h2o_quic_conn_t *to)
+{
+    quicly_conn_t *quic = from->quic;
+
+    assert(quic != NULL && from->streams_sock == NULL && from->ctx == to->ctx && to->quic == NULL);
+
+    /* the Initial packets still being received are routed to `to`; the idmap is updated by `h2o_quic_setup` */
+    if (from->_accept_hashkey != 0) {
+        khint_t iter;
+        if ((iter = kh_get_h2o_quic_acceptmap(from->ctx->conns_accepting, from->_accept_hashkey)) !=
+            kh_end(from->ctx->conns_accepting))
+            kh_val(from->ctx->conns_accepting, iter) = to;
+        to->_accept_hashkey = from->_accept_hashkey;
+        from->_accept_hashkey = 0;
+    }
+    *quicly_get_data(quic) = NULL;
+    from->quic = NULL;
+    h2o_timer_unlink(&from->_timeout);
+
+    return quic;
+}
+
+void h2o_quic_setup(h2o_quic_conn_t *conn, quicly_conn_t *quic, h2o_socket_t *streams_sock)
 {
     /* Setup relation between `h2o_quic_conn_t` and `quicly_conn_t`. At this point, `conn` will not have `quic` associated, though
      * the back pointer might have alreday been set up (see how we call `quicly_accept`). */
@@ -1267,11 +1376,18 @@ void h2o_quic_setup(h2o_quic_conn_t *conn, quicly_conn_t *quic)
     }
     conn->quic = quic;
 
-    /* register to the idmap */
-    int r;
-    khiter_t iter = kh_put_h2o_quic_idmap(conn->ctx->conns_by_id, quicly_get_master_id(conn->quic)->master_id, &r);
-    assert(iter != kh_end(conn->ctx->conns_by_id));
-    kh_val(conn->ctx->conns_by_id, iter) = conn;
+    if (streams_sock != NULL) {
+        assert(!h2o_socket_is_reading(streams_sock));
+        conn->streams_sock = streams_sock;
+        conn->streams_sock->data = conn;
+        h2o_socket_read_start(conn->streams_sock, qmux_on_read);
+    } else {
+        /* register to the idmap */
+        int r;
+        khiter_t iter = kh_put_h2o_quic_idmap(conn->ctx->conns_by_id, quicly_get_master_id(conn->quic)->master_id, &r);
+        assert(iter != kh_end(conn->ctx->conns_by_id));
+        kh_val(conn->ctx->conns_by_id, iter) = conn;
+    }
 }
 
 void h2o_http3_init_conn(h2o_http3_conn_t *conn, h2o_quic_ctx_t *ctx, const h2o_http3_conn_callbacks_t *callbacks,
@@ -1334,6 +1450,13 @@ static size_t build_firstflight(h2o_http3_conn_t *conn, uint8_t *bytebuf, size_t
         }
         ptls_buffer_push_quicint(&buf, H2O_HTTP3_SETTINGS_ENABLE_CONNECT_PROTOCOL);
         ptls_buffer_push_quicint(&buf, 1);
+        if (conn->local_settings.webtransport) {
+            ptls_buffer_push_quicint(&buf, H2O_HTTP3_SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02);
+            ptls_buffer_push_quicint(&buf, 1);
+            /* clients implementing draft-07 and later (e.g., Safari) send the extended CONNECT only once they see this */
+            ptls_buffer_push_quicint(&buf, H2O_HTTP3_SETTINGS_WEBTRANSPORT_MAX_SESSIONS_DRAFT07);
+            ptls_buffer_push_quicint(&buf, 1);
+        }
     });
 
     assert(!buf.is_allocated);
@@ -1343,11 +1466,11 @@ Exit:
     h2o_fatal("unreachable");
 }
 
-quicly_error_t h2o_http3_setup(h2o_http3_conn_t *conn, quicly_conn_t *quic)
+quicly_error_t h2o_http3_setup(h2o_http3_conn_t *conn, quicly_conn_t *quic, h2o_socket_t *streams_sock)
 {
     quicly_error_t ret;
 
-    h2o_quic_setup(&conn->super, quic);
+    h2o_quic_setup(&conn->super, quic, streams_sock);
     conn->state = H2O_HTTP3_CONN_STATE_OPEN;
 
     /* setup h3 objects, only when the connection state has been created */
@@ -1357,7 +1480,7 @@ quicly_error_t h2o_http3_setup(h2o_http3_conn_t *conn, quicly_conn_t *quic)
     conn->qpack.dec = h2o_qpack_create_decoder(conn->qpack.ctx->decoder_table_capacity, calc_max_blocked_streams(conn));
 
     { /* open control streams, send SETTINGS */
-        uint8_t firstflight[32];
+        uint8_t firstflight[64];
         size_t firstflight_len = build_firstflight(conn, firstflight, sizeof(firstflight));
         if ((ret = open_egress_unistream(conn, &conn->_control_streams.egress.control, &conn->stats.bytes_sent.control_stream,
                                          h2o_iovec_init(firstflight, firstflight_len))) != 0)
@@ -1381,32 +1504,49 @@ Exit:
 
 quicly_error_t h2o_quic_send(h2o_quic_conn_t *conn)
 {
-    quicly_address_t dest, src;
-    struct iovec datagrams[10];
-    size_t num_datagrams = PTLS_ELEMENTSOF(datagrams);
-    uint8_t datagram_buf[1500 * PTLS_ELEMENTSOF(datagrams)];
+    quicly_error_t send_result;
 
-    quicly_error_t ret = quicly_send(conn->quic, &dest, &src, datagrams, &num_datagrams, datagram_buf, sizeof(datagram_buf));
-    switch (ret) {
-    case 0:
+    if (conn->streams_sock != NULL) {
+        if (h2o_socket_is_writing(conn->streams_sock))
+            return 1;
+        /* The record is built in a buffer of the connection, as `h2o_socket_write` does not copy the data, and the rest of a record
+         * written partially is written once the socket becomes writable. One write is in flight at a time (see above). */
+        if (conn->_streams_sendbuf == NULL)
+            conn->_streams_sendbuf = h2o_mem_alloc(H2O_QUIC_STREAMS_SENDBUF_SIZE);
+        h2o_iovec_t vec = h2o_iovec_init(conn->_streams_sendbuf, H2O_QUIC_STREAMS_SENDBUF_SIZE);
+        if ((send_result = quicly_qmux_send(conn->quic, vec.base, &vec.len)) != 0)
+            goto Fail;
+        if (vec.len != 0)
+            h2o_socket_write(conn->streams_sock, &vec, 1, qmux_on_write_complete);
+    } else {
+        quicly_address_t dest, src;
+        struct iovec datagrams[10];
+        size_t num_datagrams = PTLS_ELEMENTSOF(datagrams);
+        uint8_t datagram_buf[1500 * PTLS_ELEMENTSOF(datagrams)];
+        if ((send_result = quicly_send(conn->quic, &dest, &src, datagrams, &num_datagrams, datagram_buf, sizeof(datagram_buf))) !=
+            0)
+            goto Fail;
         if (num_datagrams != 0 &&
             !h2o_quic_send_datagrams(conn->ctx, &dest, &src, datagrams, num_datagrams, quicly_send_get_ecn_bits(conn->quic))) {
             /* FIXME close the connection immediately */
-            break;
         }
-        break;
+    }
+
+    h2o_quic_schedule_timer(conn);
+    return 1;
+
+Fail:
+    switch (send_result) {
     default:
-        fprintf(stderr, "%s: `quicly_send()` returned ret:%" PRId64 "\n", __func__, ret);
+        fprintf(stderr, "%s: `%s()` returned ret:%" PRId64 "\n", __func__,
+                conn->streams_sock != NULL ? "quicly_qmux_send" : "quicly_send", send_result);
         /* fall through */
     case QUICLY_ERROR_STATE_EXHAUSTION:
     case QUICLY_ERROR_FREE_CONNECTION:
         conn->callbacks->destroy_connection(conn);
-        return 0;
+        break;
     }
-
-    h2o_quic_schedule_timer(conn);
-
-    return 1;
+    return 0;
 }
 
 void h2o_http3_update_recvbuf(h2o_buffer_t **buf, size_t off, const void *src, size_t len)
@@ -1417,7 +1557,9 @@ void h2o_http3_update_recvbuf(h2o_buffer_t **buf, size_t off, const void *src, s
         h2o_buffer_reserve(buf, new_size - (*buf)->size);
         (*buf)->size = new_size;
     }
-    memcpy((*buf)->bytes + off, src, len);
+    /* a zero-length frame (e.g., a bare FIN) on a buffer that has nothing allocated would pass NULL to memcpy */
+    if (len != 0)
+        memcpy((*buf)->bytes + off, src, len);
 }
 
 void h2o_quic_schedule_timer(h2o_quic_conn_t *conn)
@@ -1473,6 +1615,22 @@ int h2o_http3_handle_settings_frame(h2o_http3_conn_t *conn, const uint8_t *paylo
             } break;
             default:
                 goto Malformed;
+            }
+            break;
+        case H2O_HTTP3_SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02:
+            /* checked as draft-02 section 3.1 requires and quiche does, unless we do not advertise WebTransport, in which case it
+             * is ignored as any other unknown setting */
+            if (!conn->local_settings.webtransport)
+                break;
+            switch (value) {
+            case 0:
+                break;
+            case 1:
+                conn->peer_settings.webtransport = 1;
+                break;
+            default:
+                *err_desc = "invalid SETTINGS_ENABLE_WEBTRANSPORT";
+                return H2O_HTTP3_ERROR_SETTINGS;
             }
             break;
         default:
